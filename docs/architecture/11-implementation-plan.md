@@ -31,8 +31,8 @@
 
 | Phase | Scope | Key deliverables | Exit criteria |
 |-------|-------|------------------|---------------|
-| **1 Architecture** ✅ (this) | Design | `docs/architecture/*` | Reviewed and decisions D1–D8 answered |
-| **2 Database** | Migrations 0001–0016, seeders, Capsule bootstrap, migration runner, CLI `migrate`, module `_activate`/`_upgrade`/`_deactivate`, schema integrity tests | `whmcs/modules/addons/marketplace/{marketplace.php,migrations,database/seeds,src/Infrastructure/Persistence,bin}` | Fresh install, upgrade (re-run) and rollback proven on MySQL 8 and MariaDB 10.6 in CI. FK and index assertions in tests. |
+| **1 Architecture** ✅ | Design | `docs/architecture/*` | Reviewed and decisions D1–D8 answered |
+| **2 Database** ✅ ([report](../phases/phase-2-database.md)) | Migrations 0001–0016, seeders, Capsule bootstrap, migration runner, CLI `migrate`, module `_activate`/`_upgrade`/`_deactivate`, schema integrity tests | `whmcs/modules/addons/marketplace/{marketplace.php,migrations,database/seeds,src/Infrastructure/Persistence,bin}` | Fresh install, upgrade (re-run) and rollback proven on MySQL 8 and MariaDB 10.6 in CI. FK and index assertions in tests. |
 | **3 Marketplace core** | Kernel, router, middleware, DI, settings, i18n. Categories, product types, products, tiers, media, cart, checkout (AddOrder carrier flow), orders, wishlist, follows, reviews. Server module skeleton. | Client-area storefront (list, detail, category, search), cart and checkout | Checkout → invoice → paid → order completed on the WHMCS integration stack. Price-tamper tests pass. |
 | **4 Financial** | Money, commission engine, ledger, wallets, coupons, payouts (manual, PayPal, Stripe Connect), refunds + WHMCS reconciliation, tax readback | `src/Domain/Finance`, `src/Application/Finance`, provider adapters | Test matrix in 04 §9 green. `ledger:verify` clean after 10k randomised scenario runs. |
 | **5 Licensing & downloads** | Licence engine and API (signed responses), entitlements, download tokens, storage (local + S3), scanning (ClamAV), versions, update notifications, vendor SDK | `download.php`, `/v1/licenses/*`, `sdk/php`, `sdk/wordpress-updater` | Concurrency tests on activation limits. Download authorisation matrix passes. S3 presign tested against MinIO. |
@@ -56,6 +56,10 @@ flagged in progress reports:
 * search adapters for Meilisearch, OpenSearch and Algolia
 
 ## 4. Decisions needing review
+
+> **Status:** the user said "continue" after Phase 1 without answering individually, so
+> Phases 2+ proceed on the **recommendations below** as working defaults. Any of them can
+> still be changed. D1–D5 mainly affect Phases 3–4.
 
 | # | Decision | Recommendation |
 |---|----------|----------------|

@@ -1,0 +1,129 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * Marketplace administrative CLI (master prompt §97).
+ *
+ * Inside a WHMCS installation it boots WHMCS (init.php) and uses WHMCS's
+ * database connection. For development outside WHMCS, set MKP_STANDALONE=1 and
+ * the MKP_DB_* variables; this requires the repository's dev dependencies.
+ *
+ * Commands implemented in Phase 2:
+ *   install                          migrate + seed default data
+ *   migrate                          apply pending migrations
+ *   migrate:status                   list migrations and whether they ran
+ *   migrate:rollback [--steps=N] [--force-destroy-financial-data]
+ *   db:seed                          insert missing default data
+ *   schema:verify                    schema integrity check (exit 1 on ERROR)
+ */
+
+declare(strict_types=1);
+
+use WhmcsMarketplace\Application\Installer;
+use WhmcsMarketplace\Infrastructure\Persistence\DatabaseContext;
+use WhmcsMarketplace\Infrastructure\Persistence\Schema\SchemaVerifier;
+use WhmcsMarketplace\Infrastructure\Persistence\Seeding\DatabaseSeeder;
+use WhmcsMarketplace\Infrastructure\Persistence\StandaloneDatabaseContext;
+use WhmcsMarketplace\Infrastructure\Persistence\WhmcsDatabaseContext;
+use WhmcsMarketplace\Kernel\ModuleInfo;
+
+if (PHP_SAPI !== 'cli') {
+    http_response_code(404);
+    exit(1);
+}
+
+$moduleDir = dirname(__DIR__);
+$whmcsInit = dirname($moduleDir, 3) . '/init.php';
+
+function marketplace_cli_context(string $moduleDir, string $whmcsInit): DatabaseContext
+{
+    if (getenv('MKP_STANDALONE') !== '1' && is_file($whmcsInit)) {
+        require_once $whmcsInit;
+        require_once $moduleDir . '/bootstrap.php';
+
+        return new WhmcsDatabaseContext();
+    }
+
+    $autoload = dirname($moduleDir, 4) . '/vendor/autoload.php';
+    if (!is_file($autoload)) {
+        fwrite(STDERR, "WHMCS init.php not found and no development autoloader at {$autoload}.\n");
+        exit(2);
+    }
+    require_once $autoload;
+    require_once $moduleDir . '/bootstrap.php';
+
+    return StandaloneDatabaseContext::fromEnvironment();
+}
+
+$args = array_slice($argv, 1);
+$command = $args[0] ?? 'help';
+$options = [];
+foreach (array_slice($args, 1) as $arg) {
+    if (preg_match('/^--([a-z0-9-]+)(?:=(.*))?$/', $arg, $m)) {
+        $options[$m[1]] = $m[2] ?? true;
+    }
+}
+
+if (in_array($command, ['help', '--help', '-h'], true)) {
+    $doc = (string) file_get_contents(__FILE__);
+    preg_match('/Commands implemented.*?\*\//s', $doc, $m);
+    echo "Usage: bin/marketplace <command> [options]\n\n"
+        . preg_replace('/^\s*\*\s?/m', '', rtrim($m[0] ?? '', "*/ \n")) . "\n";
+    exit(0);
+}
+
+try {
+    $db = marketplace_cli_context($moduleDir, $whmcsInit);
+    $installer = new Installer($db, ModuleInfo::migrationsDir(), ModuleInfo::configDir());
+    $migrator = $installer->migrator();
+
+    switch ($command) {
+        case 'install':
+            $result = $installer->install();
+            printf("Applied %d migration(s).\n", count($result['migrated']));
+            foreach ($result['seeded'] as $seeder => $count) {
+                printf("Seeded %-18s %d row(s)\n", $seeder, $count);
+            }
+            exit(0);
+
+        case 'migrate':
+            $ran = $migrator->migrate();
+            echo $ran === [] ? "Nothing to migrate.\n" : implode("\n", array_map(static fn ($n) => "Migrated: {$n}", $ran)) . "\n";
+            exit(0);
+
+        case 'migrate:status':
+            foreach ($migrator->status() as $row) {
+                printf("%-8s %-45s %s\n", $row['ran'] ? 'Ran' : 'Pending', $row['migration'], $row['batch'] ?? '');
+            }
+            exit(0);
+
+        case 'migrate:rollback':
+            $steps = isset($options['steps']) ? (int) $options['steps'] : 1;
+            $rolled = $migrator->rollback($steps, isset($options['force-destroy-financial-data']));
+            echo $rolled === [] ? "Nothing to roll back.\n" : implode("\n", array_map(static fn ($n) => "Rolled back: {$n}", $rolled)) . "\n";
+            exit(0);
+
+        case 'db:seed':
+            foreach ((new DatabaseSeeder($db, ModuleInfo::configDir()))->run() as $seeder => $count) {
+                printf("Seeded %-18s %d row(s)\n", $seeder, $count);
+            }
+            exit(0);
+
+        case 'schema:verify':
+            $checks = (new SchemaVerifier($db, $migrator))->verify();
+            foreach ($checks as $check) {
+                printf("[%-7s] %-28s %s\n", $check->status, $check->code, $check->message);
+                if ($check->remediation !== '' && $check->status !== 'PASS') {
+                    printf("          -> %s\n", $check->remediation);
+                }
+            }
+            exit(SchemaVerifier::worstStatus($checks) === 'ERROR' ? 1 : 0);
+
+        default:
+            fwrite(STDERR, "Unknown command: {$command}. Run 'bin/marketplace help'.\n");
+            exit(2);
+    }
+} catch (\Throwable $e) {
+    fwrite(STDERR, get_class($e) . ': ' . $e->getMessage() . "\n");
+    exit(1);
+}

@@ -1,0 +1,7 @@
+# Defence in depth: this directory must never be web-accessible.
+# Production installs should move it outside the web root (see health check).
+Require all denied
+<IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+</IfModule>

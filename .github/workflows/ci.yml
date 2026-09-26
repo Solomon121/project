@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: PHP ${{ matrix.php }} / ${{ matrix.db.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4']
+        db:
+          - { name: 'MySQL 8.0', image: 'mysql:8.0' }
+          - { name: 'MariaDB 10.6', image: 'mariadb:10.6' }
+          - { name: 'MariaDB 10.11', image: 'mariadb:10.11' }
+    services:
+      db:
+        image: ${{ matrix.db.image }}
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MARIADB_ROOT_PASSWORD: root
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    env:
+      MKP_TEST_DB_HOST: 127.0.0.1
+      MKP_TEST_DB_PORT: 3306
+      MKP_TEST_DB_DATABASE: mkp_test
+      MKP_TEST_DB_USERNAME: mkp
+      MKP_TEST_DB_PASSWORD: mkp
+      MKP_TEST_NOTRIGGER_DATABASE: mkp_notrig
+      MKP_TEST_NOTRIGGER_USERNAME: mkp_notrig
+      MKP_TEST_NOTRIGGER_PASSWORD: mkp
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_mysql, mbstring, sodium, intl, fileinfo, zip
+          coverage: none
+
+      - name: Provision test databases and users
+        run: |
+          sudo apt-get install -y -q mysql-client >/dev/null
+          mysql -h 127.0.0.1 -uroot -proot <<'SQL'
+          CREATE DATABASE mkp_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+          CREATE DATABASE mkp_notrig CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+          CREATE USER 'mkp'@'%' IDENTIFIED BY 'mkp';
+          GRANT ALL ON mkp_test.* TO 'mkp'@'%';
+          CREATE USER 'mkp_notrig'@'%' IDENTIFIED BY 'mkp';
+          GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, REFERENCES ON mkp_notrig.* TO 'mkp_notrig'@'%';
+          SET GLOBAL log_bin_trust_function_creators = 1;
+          FLUSH PRIVILEGES;
+          SQL
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Lint (php -l)
+        run: find whmcs tests -name '*.php' -print0 | xargs -0 -n1 php -l > /dev/null
+
+      - name: PHPUnit
+        run: vendor/bin/phpunit

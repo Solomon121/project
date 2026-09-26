@@ -1,0 +1,7 @@
+/vendor/
+/.phpunit.cache/
+.phpunit.result.cache
+/whmcs/modules/addons/marketplace/storage/*
+!/whmcs/modules/addons/marketplace/storage/.htaccess
+/whmcs/modules/addons/marketplace/logs/*
+!/whmcs/modules/addons/marketplace/logs/.htaccess
