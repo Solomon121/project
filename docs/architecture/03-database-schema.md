@@ -1,0 +1,215 @@
+# 03 — Database Schema
+
+## 1. Conventions
+
+* Prefix: `mod_marketplace_` (WHMCS addon convention). It is omitted in the tables below for brevity.
+* Engine InnoDB, charset `utf8mb4`, collation `utf8mb4_unicode_ci`. Slugs, codes and hashes use `ascii_bin` or `utf8mb4_bin` where exact matching matters.
+* PK `id BIGINT UNSIGNED AUTO_INCREMENT`, unless noted. Public identifiers exposed in URLs and API are either slugs or `uuid CHAR(26)` ULIDs, never sequential IDs for sensitive objects (orders, licences, refunds, payouts, disputes).
+* Timestamps are `DATETIME(6)` in **UTC**: `created_at`, `updated_at`. Soft delete uses `deleted_at` only where recovery is a requirement (products, reviews, coupons). **Financial and audit tables have no `updated_at` and are append-only.**
+* Money is `DECIMAL(19,4)` + `currency_id INT UNSIGNED` (→ WHMCS `tblcurrencies.id`, no FK, ADR-005).
+* Enumerations are `VARCHAR(32)` validated by PHP enums, not MySQL `ENUM`, so adding a state needs no table rebuild on large tables.
+* JSON is `LONGTEXT` with `CHECK (JSON_VALID(col))` (portable across MySQL 8 and MariaDB).
+* WHMCS references (`client_id`, `user_id`, `admin_id`, `whmcs_*_id`) are `INT UNSIGNED` without FK (ADR-005). Integrity is kept by hooks and by the nightly `integrity:check` job.
+* FKs between marketplace tables use `ON DELETE RESTRICT` by default. `CASCADE` is used only for pure child rows with no independent meaning (e.g. `product_tags`). Financial tables are **always RESTRICT**.
+* Encrypted columns end with `_enc` (`VARBINARY`/`BLOB`, sodium secretbox, 08 §4). Lookup of encrypted values uses a companion `_hash` (keyed BLAKE2b/HMAC) column.
+
+Legend: **PK** primary key, **UQ** unique, **IX** index, **FK** foreign key.
+
+## 2. Platform & configuration
+
+| Table | Columns (key ones) | Keys |
+|-------|--------------------|------|
+| `migrations` | id, migration VARCHAR(191), batch INT, ran_at | UQ(migration) |
+| `settings` | `key` VARCHAR(191) PK, value LONGTEXT, is_encrypted BOOL, updated_by_admin_id, updated_at | PK(key) |
+| `roles` | id, code UQ, name, description, is_system BOOL | UQ(code) |
+| `permissions` | id, code UQ (`vendors.approve`), group, description | UQ(code) |
+| `role_permissions` | role_id FK, permission_id FK | PK(role_id, permission_id) |
+| `admin_roles` | admin_id, role_id FK, granted_by_admin_id, created_at | PK(admin_id, role_id) |
+| `processed_events` | id, source (`whmcs_hook`, `webhook_in`, `api`), event, reference, processed_at | UQ(source, event, reference): idempotency |
+| `outbox` | id, uuid UQ, event, aggregate_type, aggregate_id, payload JSON, occurred_at, dispatched_at NULL, attempts, claim_token | IX(dispatched_at, id) |
+| `jobs` | id, queue, handler, payload JSON, unique_key NULL, attempts, max_attempts, available_at, reserved_at, reserved_by, last_error TEXT, failed_at | IX(queue, reserved_at, available_at), UQ(unique_key) |
+| `cron_runs` | id, task, started_at, finished_at, status, items_processed, error | IX(task, started_at) |
+| `cache` | `key` VARBINARY(64) PK, value LONGBLOB, tags VARCHAR(255), expires_at | IX(expires_at): used only when APCu/Redis are unavailable |
+| `rate_limits` | bucket VARBINARY(32) PK, tokens DECIMAL(10,3), updated_at | DB fallback token bucket |
+| `health_events` | id, channel, severity, code, message, context JSON (redacted), created_at | IX(channel, created_at), IX(severity, created_at) |
+| `legal_pages` | id, slug UQ, title, body (sanitised HTML), version INT, requires_acceptance BOOL, published_at | UQ(slug, version) |
+| `legal_acceptances` | id, legal_page_id FK, version, actor_type, actor_id, ip VARBINARY(16), accepted_at | IX(actor_type, actor_id) |
+
+## 3. Catalogue
+
+| Table | Columns | Keys |
+|-------|---------|------|
+| `product_types` | id, code UQ (`wordpress_theme`, `domain_listing`, …), handler (class/provider code), name_key (lang), is_enabled, allowed_extensions JSON, max_file_mb, attributes_schema JSON, sort_order | UQ(code) |
+| `license_types` | id, code UQ (`single_domain`, `multi_domain`, `unlimited`, `personal`, `commercial`, `extended`, `developer`, `subscription`, `lifetime`), name_key, provider_code, default_max_activations NULL=∞, default_max_domains, is_perpetual, legal_page_id FK NULL | UQ(code) |
+| `categories` | id, parent_id FK self NULL, path VARCHAR(255) (`/1/7/`), depth TINYINT, slug UQ, name, description, icon, image_media_id, is_active, sort_order, seo_title, seo_description, product_count (denorm) | UQ(slug), IX(path), IX(parent_id, sort_order) |
+| `vendors` (see §4) | | |
+| `products` | id, uuid UQ, vendor_id FK, product_type_id FK, primary_category_id FK, slug UQ, title, short_description VARCHAR(500), description_html MEDIUMTEXT (sanitised), status, pricing_model (`one_time`, `subscription`, `free`), listing_currency_id, is_taxable, featured_media_id NULL, demo_url, documentation_url, video_url, current_version_id NULL (FK→product_versions, deferred), requirements TEXT, compatibility JSON, attributes JSON (type-specific, validated by the type handler), support_months, update_months, is_featured, featured_until, release_date DATE, published_at, last_updated_at, rejection_reason TEXT, suspended_reason TEXT, seo_title, seo_description, seo_canonical_url, created_at, updated_at, deleted_at | UQ(slug), IX(status, published_at), IX(vendor_id, status), IX(primary_category_id, status, published_at), IX(product_type_id, status), IX(is_featured, status) |
+| `product_license_tiers` | id, product_id FK, license_type_id FK, name, price DECIMAL, sale_price NULL, sale_starts_at, sale_ends_at, billing_cycle (`onetime`, `monthly`, `quarterly`, `semiannually`, `annually`, `biennially`), max_activations NULL, max_domains NULL, support_months, update_months, is_default, is_active, sort_order | IX(product_id, is_active), IX(price) |
+| `product_categories` | product_id FK CASCADE, category_id FK | PK(product_id, category_id), IX(category_id) |
+| `tags` | id, type (`tag`, `technology`, `compatibility`), slug, name, usage_count | UQ(type, slug) |
+| `product_tags` | product_id FK CASCADE, tag_id FK | PK(product_id, tag_id), IX(tag_id) |
+| `media` | id, owner_type, owner_id, kind (`image`, `screenshot`, `video`, `avatar`, `cover`, `banner`), disk, storage_key, public_url NULL (CDN), mime, width, height, size_bytes, alt, sort_order, created_at | IX(owner_type, owner_id, sort_order) |
+| `product_versions` | id, product_id FK, version VARCHAR(40), v_major, v_minor, v_patch INT, v_pre VARCHAR(20), changelog_html, compatibility JSON, is_mandatory, is_security, status (`pending_review`, `approved`, `published`, `rejected`, `withdrawn`), reviewed_by_admin_id, reviewed_at, released_at, created_by_user_id, created_at | UQ(product_id, version), IX(product_id, status, v_major, v_minor, v_patch) |
+| `product_files` | id, product_id FK, version_id FK, disk, storage_key (private, random), original_name, mime, extension, size_bytes BIGINT, sha256 CHAR(64), scan_status (`pending`, `clean`, `infected`, `error`, `skipped`), scan_engine, scanned_at, scan_report JSON, is_primary, uploaded_by_user_id, created_at | IX(version_id), IX(scan_status), UQ(disk, storage_key) |
+| `product_stats` | product_id PK FK, views, downloads, sales, favorites, reviews, rating_avg DECIMAL(3,2), rating_count, revenue_default_ccy DECIMAL, refund_count, updated_at | IX(sales), IX(rating_avg), IX(views) (sort support) |
+| `collections` | id, slug UQ, title, description, type (`manual`, `rule`), rules JSON (category_ids, tag_ids, type, min_rating, featured, sort, limit), is_featured, is_active, starts_at, ends_at, sort_order | UQ(slug) |
+| `collection_products` | collection_id FK CASCADE, product_id FK CASCADE, position | PK(collection_id, product_id), IX(collection_id, position) |
+| `search_index` | product_id PK FK, title, keywords TEXT (tags, technologies, vendor name, type, licence names), body TEXT (plain-text description), status, category_path, product_type_id, vendor_id, min_price DECIMAL, currency_id, is_free, is_featured, rating_avg, sales, published_at, updated_at | FULLTEXT(title, keywords, body), IX(status, category_path), IX(status, min_price), IX(status, rating_avg), IX(status, sales), IX(status, published_at) |
+| `product_reports` | id, product_id FK, reporter_client_id, reason, details, status, handled_by_admin_id, created_at | IX(status, created_at) |
+| `moderation_log` | id, subject_type (`product`, `version`, `vendor`, `review`), subject_id, action, admin_id, notes, checklist JSON, created_at | IX(subject_type, subject_id) |
+
+## 4. Vendors
+
+| Table | Columns | Keys |
+|-------|---------|------|
+| `vendors` | id, uuid UQ, client_id UQ (WHMCS account), owner_user_id, username UQ, slug UQ, display_name, status (`pending`, `approved`, `rejected`, `suspended`, `banned`), verification_level (`unverified`, `verified`, `business_verified`, `trusted`), payout_currency_id, default_commission_rule_id NULL FK, agreement_page_version, agreement_accepted_at, application JSON (answers), approved_by_admin_id, approved_at, status_reason TEXT, created_at, updated_at | UQ(client_id), UQ(slug), IX(status) |
+| `vendor_profiles` | vendor_id PK FK, bio_html, website, location, country_code CHAR(2), avatar_media_id, cover_media_id, social JSON, support_email, support_url, avg_response_minutes, seo_title, seo_description | |
+| `vendor_business` | vendor_id PK FK, business_type (`individual`, `company`), legal_name_enc, registration_no_enc, tax_id_enc, vat_number_enc, vat_number_hash, address_enc, country_code, updated_at | IX(vat_number_hash) |
+| `vendor_documents` | id, vendor_id FK, type (`id`, `business_reg`, `tax`, `address`, `other`), disk, storage_key, mime, size_bytes, sha256, status (`submitted`, `accepted`, `rejected`, `expired`), reviewed_by_admin_id, reviewed_at, notes, created_at, purge_after | IX(vendor_id, status) |
+| `vendor_verifications` | id, vendor_id FK, level_from, level_to, method (`manual_docs`, `business_registry`, `third_party`), evidence JSON (doc ids), decided_by_admin_id, decided_at, expires_at | IX(vendor_id) |
+| `vendor_members` | vendor_id FK, user_id (WHMCS user), role (`owner`, `manager`, `editor`, `support`, `finance`), permissions JSON NULL (overrides), invited_by_user_id, created_at | PK(vendor_id, user_id), IX(user_id) |
+| `vendor_stats` | vendor_id PK FK, products_published, sales, revenue_default_ccy, rating_avg, rating_count, followers, refund_rate DECIMAL(5,4), updated_at | IX(sales), IX(rating_avg) |
+| `vendor_followers` | vendor_id FK, client_id, notify_new_products BOOL, created_at | PK(vendor_id, client_id), IX(client_id) |
+| `vendor_payout_methods` | id, vendor_id FK, provider_code, label, details_enc, details_fingerprint, is_default, status (`pending_verification`, `active`, `disabled`), verified_at, created_at, updated_at | IX(vendor_id, status) |
+
+## 5. Sales
+
+| Table | Columns | Keys |
+|-------|---------|------|
+| `carts` | id, token_hash BINARY(32) UQ, client_id NULL, user_id NULL, currency_id, coupon_code NULL, status (`active`, `converted`, `abandoned`, `recovered`, `expired`), last_activity_at, recovery_token_hash NULL, recovery_sent_at NULL, recovery_discount_coupon_id NULL, converted_order_id NULL, created_at | UQ(token_hash), IX(client_id, status), IX(status, last_activity_at) |
+| `cart_items` | id, cart_id FK CASCADE, product_id FK, license_tier_id FK, quantity SMALLINT, saved_for_later BOOL, options JSON (domain name, service brief), added_at | UQ(cart_id, product_id, license_tier_id, saved_for_later) |
+| `orders` | id, uuid UQ, order_number UQ, client_id, user_id, whmcs_order_id UQ NULL, whmcs_invoice_id NULL, currency_id, fx_rate_to_default DECIMAL(19,8), subtotal, discount_total, tax_total, total, status (10 states §12), payment_status (`unpaid`, `paid`, `partially_refunded`, `refunded`, `failed`), fulfillment_status (`unfulfilled`, `partial`, `fulfilled`), coupon_id NULL FK, affiliate_account_id NULL, referral_id NULL, ip VARBINARY(16), idempotency_key UQ, paid_at, completed_at, cancelled_at, created_at, updated_at | IX(client_id, created_at), IX(status, created_at), IX(whmcs_invoice_id) |
+| `order_items` | id, uuid UQ, order_id FK, vendor_id FK, product_id FK, license_tier_id FK, version_id_at_purchase NULL, whmcs_service_id UQ NULL, whmcs_domain_id NULL, title_snapshot, tier_snapshot JSON, quantity, unit_price, discount_amount, discount_funded_by (`platform`, `vendor`, `split`), net_amount (pre-tax), tax_amount, line_total, commission_amount, fee_amount, vendor_net_amount, commission_snapshot JSON, billing_cycle, status, fulfillment_status, refunded_amount, created_at, updated_at | IX(order_id), IX(vendor_id, created_at), IX(product_id, created_at), IX(vendor_id, status) |
+| `order_status_history` | id, order_id FK, order_item_id NULL FK, field (`status`, `payment_status`, `fulfillment_status`), from_value, to_value, actor_type, actor_id, reason, created_at | IX(order_id, created_at) |
+| `subscriptions` | id, uuid UQ, order_item_id FK UQ, client_id, product_id FK, license_tier_id FK, whmcs_service_id UQ, license_id NULL FK, billing_cycle, recurring_amount, currency_id, status (`active`, `past_due`, `suspended`, `cancelled`, `expired`), next_due_date DATE (mirror), cancel_requested_at, ended_at, updated_at | IX(client_id, status), IX(status, next_due_date) |
+| `entitlements` (§58 "product_support") | id, order_item_id FK, client_id, product_id FK, license_id NULL FK, downloads_allowed BOOL, support_expires_at, updates_expires_at, max_downloads NULL, downloads_used, source (`purchase`, `renewal`, `extension`, `admin_grant`), status (`active`, `suspended`, `revoked`, `expired`), created_at, updated_at | IX(client_id, product_id, status), IX(order_item_id) |
+| `support_extensions` | id, entitlement_id FK, order_item_id FK, months, previous_support_expires_at, new_support_expires_at, created_at | IX(entitlement_id) |
+| `service_deliveries` | id, order_item_id FK UQ, vendor_id, client_id, status (`awaiting_requirements`, `in_progress`, `delivered`, `revision_requested`, `accepted`, `cancelled`), requirements JSON, due_at, delivered_at, accepted_at, auto_accept_at, revisions_used | IX(vendor_id, status), IX(status, auto_accept_at) |
+| `coupons` | id, code VARCHAR(64), code_normalized UQ, scope (`marketplace`, `vendor`, `product`, `category`), vendor_id NULL FK, type (`percentage`, `fixed`), value DECIMAL, currency_id NULL (fixed only), max_discount NULL, min_purchase NULL, first_order_only, usage_limit NULL, usage_count, per_customer_limit NULL, funded_by (`platform`, `vendor`, `split`), vendor_share_pct DECIMAL(5,2), starts_at, expires_at, is_active, created_by_type, created_by_id, created_at, updated_at, deleted_at | UQ(code_normalized), IX(vendor_id, is_active) |
+| `coupon_targets` | coupon_id FK CASCADE, target_type (`product`, `category`), target_id | PK(coupon_id, target_type, target_id) |
+| `coupon_usage` | id, coupon_id FK, order_id FK, client_id, discount_amount, currency_id, created_at | UQ(coupon_id, order_id), IX(coupon_id, client_id) |
+
+## 6. Finance (append-only where marked ⛔)
+
+| Table | Columns | Keys |
+|-------|---------|------|
+| `commission_rules` | id, scope (`global`, `vendor`, `category`, `product`, `promotion`), scope_id NULL, method (`percentage`, `fixed`, `mixed`, `tiered`), percentage DECIMAL(7,4), fixed_amount, fixed_currency_id, min_commission, max_commission, tiers JSON ([{from_sales, pct, fixed}], basis `lifetime_sales` or `trailing_30d_sales`), fee_policy JSON (processing fee: who bears, pct+fixed), priority, starts_at, ends_at, is_active, created_by_admin_id, created_at, superseded_by NULL | IX(scope, scope_id, is_active), IX(starts_at, ends_at). Rules are **versioned**: edits create a new row and set `superseded_by`, so history is preserved. |
+| `commissions` ⛔ | id, order_item_id FK UQ, vendor_id FK, rule_id FK, currency_id, gross_amount, discount_vendor_funded, net_amount, commission_amount, processing_fee, tax_withheld, vendor_net, breakdown JSON (every step of the calculation), created_at | IX(vendor_id, created_at) |
+| `commission_adjustments` ⛔ | id, commission_id FK, refund_id NULL FK, type (`reversal`, `partial_reversal`, `manual`), commission_delta, fee_delta, vendor_net_delta, reason, admin_id NULL, created_at | IX(commission_id) |
+| `wallets` | id, vendor_id FK, currency_id, available, pending, reserved, paid_total, lifetime_earnings, refunded_total, last_entry_id, last_entry_hash, version INT, updated_at | UQ(vendor_id, currency_id). **Cache of the ledger.** Updated only by `LedgerService` in the same TX as the entry. |
+| `wallet_transactions` ⛔ (ledger) | id, uuid UQ, wallet_id FK, vendor_id FK, currency_id, type (§04-3.2), bucket_from, bucket_to, amount (always positive), available_after, pending_after, reserved_after, order_id NULL FK, order_item_id NULL FK, product_id NULL, refund_id NULL FK, payout_id NULL FK, dispute_id NULL, commission_id NULL FK, gross_amount, commission_amount, fee_amount, net_amount, fx_rate DECIMAL(19,8) NULL, description, idempotency_key UQ, release_at NULL (for pending → available), actor_type, actor_id, prev_hash BINARY(32), entry_hash BINARY(32), created_at | UQ(idempotency_key), IX(wallet_id, id), IX(vendor_id, created_at), IX(type, release_at), IX(order_item_id) |
+| `payout_batches` | id, uuid UQ, schedule (`manual`, `weekly`, `monthly`, …), provider_code, status, item_count, total, currency_id, created_by, created_at, completed_at | |
+| `payouts` | id, uuid UQ, vendor_id FK, wallet_id FK, batch_id NULL FK, payout_method_id FK, provider_code, method_snapshot_enc, amount, fee, net_amount, currency_id, status (`requested`, `approved`, `processing`, `completed`, `rejected`, `failed`, `cancelled`), requested_by_user_id, requested_at, approved_by_admin_id, approved_at, processed_at, provider_reference, failure_code, failure_reason, idempotency_key UQ, created_at, updated_at | IX(vendor_id, status), IX(status, requested_at) |
+| `payout_events` ⛔ | id, payout_id FK, from_status, to_status, actor_type, actor_id, note, provider_response JSON (redacted), created_at | IX(payout_id) |
+| `refunds` | id, uuid UQ, refund_number UQ, order_id FK, order_item_id NULL FK, client_id, vendor_id FK, currency_id, requested_amount, approved_amount, type (`full`, `partial`), reason_code, reason_text, status (§15 7 states), eligible_until, vendor_decision (`pending`, `accept`, `contest`), vendor_decided_at, vendor_note, admin_id NULL, admin_note, auto_rule_id NULL, execution_method (`gateway_manual`, `account_credit`, `gateway_api`), whmcs_transaction_id NULL, commission_reversed, vendor_debited, fees_retained, completed_at, created_at, updated_at | IX(order_id), IX(vendor_id, status), IX(status, created_at), IX(client_id) |
+| `refund_events` ⛔ | id, refund_id FK, from_status, to_status, actor_type, actor_id, note, created_at | IX(refund_id) |
+| `attachments` | id, owner_type (`refund`, `dispute_message`, `ip_complaint`, `vendor_document`), owner_id, disk, storage_key, original_name, mime, size_bytes, sha256, scan_status, uploaded_by_type, uploaded_by_id, created_at | IX(owner_type, owner_id) |
+
+## 7. Licensing & delivery
+
+| Table | Columns | Keys |
+|-------|---------|------|
+| `licenses` | id, uuid UQ, key_hash BINARY(32) UQ (HMAC-SHA256 of normalised key), key_enc (for owner display), key_prefix CHAR(8), product_id FK, order_item_id FK, client_id, vendor_id FK, license_type_id FK, provider_code, status (`active`, `inactive`, `expired`, `suspended`, `revoked`, `blocked`, `pending`), max_activations NULL, max_domains NULL, activation_count, allowed_ips JSON NULL, starts_at, expires_at NULL, parent_license_id NULL FK (transfer lineage), status_reason, created_at, updated_at | UQ(key_hash), IX(client_id, status), IX(product_id, status), IX(status, expires_at), IX(order_item_id) |
+| `license_activations` | id, license_id FK, instance_hash BINARY(32), domain VARCHAR(253) (normalised, IDN→punycode), ip VARBINARY(16), fingerprint_hash BINARY(32) NULL, software_version, environment (`production`, `staging`, `local`), status (`active`, `deactivated`), activated_at, last_seen_at, deactivated_at, deactivated_by | UQ(license_id, instance_hash), IX(license_id, status), IX(domain) |
+| `license_events` ⛔ | id, license_id FK, event (`created`, `activated`, `deactivated`, `validated`, `validation_failed`, `suspended`, `revoked`, `expired`, `renewed`, `transferred`, `blacklist_hit`), actor_type, actor_id, ip, data JSON, created_at | IX(license_id, created_at), IX(event, created_at) |
+| `license_blacklist` | id, type (`key`, `domain`, `ip`, `fingerprint`), value_hash BINARY(32), product_id NULL, reason, created_by_admin_id, created_at, expires_at | UQ(type, value_hash, product_id) |
+| `license_transfers` | id, license_id FK, from_client_id, to_client_id, status (`requested`, `approved`, `rejected`, `completed`), fee_order_id NULL, decided_by_admin_id, created_at, completed_at | IX(license_id) |
+| `download_tokens` | id, token_hash BINARY(32) UQ, client_id, user_id, entitlement_id FK, product_file_id FK, ip_bind VARBINARY(16) NULL, max_uses, use_count, expires_at, created_at | UQ(token_hash), IX(expires_at) |
+| `downloads` ⛔ (log) | id, client_id, user_id, product_id, product_file_id, version_id, entitlement_id, token_id NULL, ip VARBINARY(16), user_agent VARCHAR(255), result (`success`, `denied`, `error`), reason, bytes_sent, created_at | IX(client_id, created_at), IX(product_id, created_at), IX(ip, created_at). Candidate for monthly RANGE partitioning past 10M rows. |
+
+## 8. Social, trust, engagement
+
+| Table | Columns | Keys |
+|-------|---------|------|
+| `reviews` | id, uuid UQ, target_type (`product`, `vendor`), product_id NULL FK, vendor_id FK, client_id, user_id, order_item_id NULL FK, rating TINYINT (1–5, CHECK), title, body, status (`pending`, `approved`, `rejected`, `hidden`, `flagged`), is_verified_purchase, helpful_count, unhelpful_count, report_count, vendor_response, vendor_responded_at, moderated_by_admin_id, moderated_at, abuse_score DECIMAL(4,3), created_at, updated_at, deleted_at | UQ(target_type, product_id, vendor_id, client_id), IX(product_id, status, created_at), IX(vendor_id, status) |
+| `review_votes` | review_id FK CASCADE, client_id, vote TINYINT (−1, +1), created_at | PK(review_id, client_id) |
+| `review_reports` | id, review_id FK, client_id, reason, status, handled_by_admin_id, created_at | UQ(review_id, client_id) |
+| `wishlists` | client_id, product_id FK CASCADE, notify_price_drop, notify_updates, price_at_add DECIMAL, currency_id, created_at | PK(client_id, product_id), IX(product_id) |
+| `disputes` | id, uuid UQ, dispute_number UQ, order_id FK, order_item_id FK, client_id, vendor_id FK, reason_code, status (`open`, `awaiting_vendor`, `awaiting_buyer`, `under_review`, `resolved`, `closed`), resolution (`refund_full`, `refund_partial`, `no_action`, `withdrawn`), resolution_amount, refund_id NULL FK, assigned_admin_id NULL, whmcs_ticket_id NULL, vendor_deadline_at, opened_at, resolved_at, closed_at | IX(vendor_id, status), IX(status, vendor_deadline_at), IX(client_id) |
+| `dispute_messages` ⛔ | id, dispute_id FK, author_type (`buyer`, `vendor`, `admin`, `system`), author_id, body, is_internal BOOL, created_at | IX(dispute_id, created_at) |
+| `ip_complaints` | id, uuid UQ, product_id FK, complainant_name, complainant_email, rights_owner, work_description, infringing_urls JSON, statement_good_faith BOOL, signature, status (`submitted`, `under_review`, `vendor_notified`, `product_suspended`, `counter_notice`, `upheld`, `rejected`, `withdrawn`), vendor_response, counter_notice JSON, handled_by_admin_id, created_at, resolved_at | IX(product_id), IX(status) |
+| `notifications` | id, recipient_type (`client`, `vendor`, `admin`), recipient_id, category (`system`, `order`, `product`, `license`, `review`, `payout`, `refund`, `dispute`, `security`, `promotion`), event, title, body, url, data JSON, read_at NULL, created_at | IX(recipient_type, recipient_id, read_at, id) |
+| `notification_preferences` | recipient_type, recipient_id, category, channel (`email`, `inapp`), enabled | PK(recipient_type, recipient_id, category, channel) |
+| `email_template_map` | event UQ, whmcs_template_name, is_enabled, recipients (`client`, `vendor`, `admin`) | UQ(event) |
+| `affiliate_accounts` | id, client_id UQ, code UQ, status, rate_type, rate, cookie_days, balance_pending, balance_available, currency_id, created_at | *optional module, tables created only when enabled* |
+| `affiliate_clicks` | id, affiliate_account_id FK, landing_url, ip_hash, ua_hash, referrer, created_at | IX(affiliate_account_id, created_at) |
+| `affiliate_conversions` ⛔ | id, affiliate_account_id FK, order_id FK, order_item_id FK, amount, commission, status (`pending`, `approved`, `reversed`, `paid`), created_at | UQ(order_item_id, affiliate_account_id) |
+| `referrals` | id, referrer_client_id, referee_client_id UQ, invite_code, status (`invited`, `registered`, `qualified`, `rewarded`, `void`), reward_type, reward_amount, rewarded_at, created_at | IX(referrer_client_id) |
+| `domain_listings` | id, uuid UQ, vendor_id FK, domain, tld, listing_type (`fixed`, `offer`, `auction`), price, min_offer, reserve_price, currency_id, auction_ends_at, status, ownership_token_hash, ownership_verified_at, transfer_method (`epp_transfer`, `internal_move`), whmcs_domain_id NULL, buyer_client_id NULL, order_item_id NULL, created_at, updated_at | IX(domain, status), IX(status, auction_ends_at). One live listing per domain is enforced in the service under a row lock. |
+| `domain_bids` ⛔ | id, listing_id FK, client_id, amount, created_at, is_winning | IX(listing_id, amount) |
+| `privacy_requests` | id, client_id, type (`export`, `erase`), status, file_key NULL, requested_at, processed_at, processed_by_admin_id | IX(client_id) |
+| `stats_daily` | day DATE, dimension (`platform`, `vendor`, `product`, `category`), dimension_id, currency_id, views, unique_views, orders, units, gross, discounts, commission, fees, vendor_net, refunds, downloads | PK(day, dimension, dimension_id, currency_id), IX(dimension, dimension_id, day) |
+| `view_buffer` | product_id, day, views | PK(product_id, day): write-optimised counter, folded into `stats_daily` by cron |
+
+## 9. Security & API
+
+| Table | Columns | Keys |
+|-------|---------|------|
+| `audit_logs` ⛔ | id, uuid, actor_type (`admin`, `user`, `vendor_member`, `system`, `api_key`), actor_id, on_behalf_client_id NULL, action (`product.approve`), subject_type, subject_id, ip VARBINARY(16), user_agent, request_id, before JSON (redacted), after JSON (redacted), prev_hash, entry_hash, created_at | IX(subject_type, subject_id, created_at), IX(actor_type, actor_id, created_at), IX(action, created_at) |
+| `api_keys` | id, uuid UQ, name, owner_type (`site`, `vendor`, `integration`), owner_id NULL, key_id VARCHAR(32) UQ (public), secret_enc (HMAC secret; needed server-side), scopes JSON, allowed_ips JSON NULL, allowed_origins JSON NULL, rate_limit_per_min, last_used_at, last_used_ip, expires_at NULL, revoked_at NULL, created_by_admin_id, created_at | UQ(key_id) |
+| `api_nonces` | key_id, nonce_hash BINARY(16), expires_at | PK(key_id, nonce_hash), IX(expires_at): replay protection |
+| `user_tokens` | id, api_key_id FK (issuing site), client_id, user_id, access_hash BINARY(32) UQ, refresh_hash BINARY(32) UQ, scopes JSON, access_expires_at, refresh_expires_at, revoked_at, last_used_at, created_at | IX(user_id), IX(refresh_expires_at) |
+| `link_codes` | code_hash BINARY(32) PK, api_key_id, user_id, client_id, redirect_uri, pkce_challenge, expires_at, used_at | one-time authorisation codes for WP account link (07 §6) |
+| `webhook_endpoints` | id, uuid UQ, api_key_id NULL FK, url, secret_enc, events JSON, is_active, consecutive_failures, disabled_at, created_at | |
+| `webhook_deliveries` | id, endpoint_id FK, event_uuid, event, payload JSON, attempt, status (`pending`, `delivered`, `failed`, `dead`), response_code, response_excerpt VARCHAR(1024), duration_ms, next_attempt_at, delivered_at, created_at | UQ(endpoint_id, event_uuid), IX(status, next_attempt_at) |
+| `security_events` | id, type (`login_fail`, `csrf_fail`, `rate_limited`, `authz_denied`, `upload_rejected`, `sig_invalid`, `download_abuse`), actor_type, actor_id, ip, detail JSON, created_at | IX(type, created_at), IX(ip, created_at) |
+| `fraud_rules` / `fraud_flags` | rules: id, code, config JSON, action (`flag`, `hold`, `block`), is_active · flags: id, subject_type, subject_id, rule_code, score, status, created_at | |
+
+## 10. Relationships (core)
+
+```text
+vendors 1─* products 1─* product_license_tiers *─1 license_types
+    │          │ 1─* product_versions 1─* product_files
+    │          │ *─* categories (product_categories)    *─* tags (product_tags)
+    │          │ 1─1 product_stats   1─1 search_index
+    │ 1─* vendor_members  1─* vendor_payout_methods  1─* wallets 1─* wallet_transactions
+    │
+orders 1─* order_items *─1 vendors
+             │ 1─1 commissions 1─* commission_adjustments
+             │ 1─* entitlements 1─* download_tokens
+             │ 1─* licenses 1─* license_activations
+             │ 0..1 subscriptions   0..1 service_deliveries
+             │ 1─* refunds  1─* disputes 1─* dispute_messages
+payouts *─1 wallets ;  wallet_transactions → (order_item | refund | payout | commission)
+```
+
+## 11. Migration plan (§57)
+
+Migrations are PHP classes with `up()` / `down()` using Capsule schema builder (raw SQL
+only for FULLTEXT / CHECK constraints). Each runs inside a guarded batch. Because MySQL DDL
+auto-commits, every migration is written to be **re-runnable** (checks `hasTable`/`hasColumn`).
+
+| # | Migration | Tables |
+|---|-----------|--------|
+| 0001 | create_platform_tables | migrations, settings, processed_events, outbox, jobs, cron_runs, cache, rate_limits, health_events |
+| 0002 | create_rbac_tables | roles, permissions, role_permissions, admin_roles |
+| 0003 | create_catalog_taxonomy | product_types, license_types, categories, tags |
+| 0004 | create_vendor_tables | vendors, vendor_profiles, vendor_business, vendor_documents, vendor_verifications, vendor_members, vendor_stats, vendor_followers, vendor_payout_methods |
+| 0005 | create_product_tables | products, product_license_tiers, product_categories, product_tags, media, product_versions, product_files, product_stats, product_reports, moderation_log |
+| 0006 | create_search_and_collections | search_index (+FULLTEXT), collections, collection_products |
+| 0007 | create_sales_tables | carts, cart_items, orders, order_items, order_status_history, subscriptions, entitlements, support_extensions, service_deliveries |
+| 0008 | create_coupon_tables | coupons, coupon_targets, coupon_usage |
+| 0009 | create_finance_tables | commission_rules, commissions, commission_adjustments, wallets, wallet_transactions, payout_batches, payouts, payout_events, refunds, refund_events, attachments |
+| 0010 | create_licensing_tables | licenses, license_activations, license_events, license_blacklist, license_transfers, download_tokens, downloads |
+| 0011 | create_social_trust_tables | reviews, review_votes, review_reports, wishlists, disputes, dispute_messages, ip_complaints |
+| 0012 | create_engagement_tables | notifications, notification_preferences, email_template_map, stats_daily, view_buffer, privacy_requests, legal_pages, legal_acceptances |
+| 0013 | create_security_api_tables | audit_logs, api_keys, api_nonces, user_tokens, link_codes, webhook_endpoints, webhook_deliveries, security_events, fraud_rules, fraud_flags |
+| 0014 | create_domain_marketplace_tables | domain_listings, domain_bids |
+| 0015 | create_affiliate_tables (conditional) | affiliate_accounts, affiliate_clicks, affiliate_conversions, referrals |
+| 0016 | install_append_only_triggers (conditional) | `BEFORE UPDATE/DELETE` triggers raising SIGNAL on ⛔ tables, if the DB user has TRIGGER privilege. Otherwise the health check shows WARNING and application-level guards apply. |
+
+Seeders (idempotent, keyed by `code`): roles and permissions, product types (§4 list),
+licence types, default category tree (§20), default settings, legal page placeholders
+(explicitly marked "template, not legal advice"), WHMCS email templates, carrier products.
+
+**Rollback:** `down()` exists for every migration. Rolling back a finance migration with
+data present is **refused** unless `--force-destroy-financial-data` is passed after an
+export. Uninstall follows the same rule (01 §2.1).
+
+## 12. Scale notes (§38)
+
+* Every list query is paginated. Large admin tables (orders, ledger, downloads, audit) use **keyset pagination** (`WHERE id < ? ORDER BY id DESC LIMIT n`), with offset pagination only for small result sets.
+* Counters (views, downloads, sales, ratings) live in `*_stats` tables updated asynchronously, so hot catalogue rows are not write-locked by traffic.
+* Catalogue listing reads only `search_index` (one table, covering indexes). Product cards are hydrated with a single `WHERE id IN (…)` batch for vendor names and media (no N+1).
+* 1M+ orders: `order_items(vendor_id, created_at)` serves vendor dashboards, and aggregates come from `stats_daily`, never from live `SUM()` over the orders table.
+* `downloads`, `license_events`, `audit_logs` and `webhook_deliveries` have retention settings and archive jobs. Partitioning is documented as an optional DBA step.
